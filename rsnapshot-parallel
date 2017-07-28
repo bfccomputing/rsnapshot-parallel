@@ -1,0 +1,187 @@
+#!/usr/bin/perl -w
+use warnings FATAL=>'all';
+use Data::Dumper;
+
+=description
+rsync will not fully utilize your backup disk speed, thereby making your backups take
+2-3 times longer than they should.  Parallel rsync works just fine to keep your disks busy.
+
+This is a script that works based off a single rsnapshot.conf file.  
+It handles making jobs for each host defined in the config file and sets 
+up a crontab to run them in sequence, probably overlaping in time 
+(you can tune the JOB_INTERVAL to make that happen).
+
+It understands simple rsnapshot configurations like this:
+
+backup  backup@repo:/.        repo/    +rsync_long_args=--whole-file
+backup  backup@repo:/boot/.   repo/    +rsync_long_args=--whole-file
+
+The cronjob order will be based on the order in /etc/rsnapshot.conf.  Currently
+this will only build a 'daily' cronjob.  It could be extended to do more intervals
+but here we're using filesystem-level snapshotting now so we don't need that.
+
+The script will try to kill existing rsnapshot and rsync processes before it begins.
+
+You might want to run it with the 'bomb' mode if you need a massive immediate backup.
+This is very likely to saturate your IO bandwidth, but maybe that's what you want.
+=cut
+
+=author
+Bill McGonigle <bill@bfccomputing.com>
+=cut
+    
+=license
+WTFPL 2.0
+=cut
+
+=history
+2: bomb option
+1: works
+=cut
+    
+my $MKDIR = '/usr/bin/mkdir';
+my $CONFIG_FILE = '/etc/rsnapshot.conf';
+my $MULTICONFIG_DIR = '/etc/rsnapshot.d';
+my $DEFAULT_RUNFILE = '/var/run/rsnapshot.pid';
+my $MULTICONFIG_LOGDIR = '/var/log/rsnapshot-parallel';
+my $CRON_FILE = '/etc/cron.d/rsnapshot';
+my $START_HOUR = 00;
+my $START_MINUTE = 44;
+my $JOB_INTERVAL = 15; #minutes, no fancy date math is handled - be careful
+my $NICE = 10;
+my $IONICE = 7;
+my $BARRIER = '### BACKUP POINTS / SCRIPTS ###';  #below this in the config file are hosts
+my $KILLALL_COMMAND = '/bin/killall --older-than 12h rsync rsnapshot';
+my $RSNAPSHOT = '/usr/bin/rsnapshot';
+my $NICE_COMMAND = "/usr/bin/ionice -n $IONICE /bin/nice -n $NICE";
+my $RSNAPSHOT_COMMAND = "$RSNAPSHOT -c $MULTICONFIG_DIR/HOST.conf daily";
+
+my $template = '';
+my $past_barrier = 0;
+my $order = 0;
+my (%host_order,%host_configs);
+
+my $do_bomb = 0;
+my $do_crontab = 1;
+my $mode = shift;
+if (defined($mode)) {
+    if ($mode eq 'bomb') {
+	$do_bomb = 1;
+	$do_crontab = 0;
+    }
+}
+
+open CONFIG, $CONFIG_FILE;
+while (<CONFIG>) {
+    chomp;
+    if ($_ =~ m/$BARRIER/) {
+	$past_barrier = 1;
+	next;
+    }
+    if (!$past_barrier) {
+	$template .= $_ . "\n";
+    } else {
+	next if $_ =~ m/^#/;
+	next if $_ =~ m/^\s*$/;
+	m/^(.*?)\t+(.*?)\t+(.*?)\t+(.*?)$/;
+	my ($type,$remote,$dest,$opts) = ($1,$2,$3,$4);
+	my $host = 'localhost';
+	if ($remote =~ m/^.*?\@(.*?)\:/) {
+	    $host = $1;
+	}
+	if (!defined($host_order{$host})) {
+	    $host_order{$host} = $order;
+	    $order++;
+	}
+	$host_configs{$host}{$remote}{dest} = $dest;
+	$host_configs{$host}{$remote}{opts} = $opts;
+    }
+}
+close CONFIG;
+
+#print Dumper(\%host_configs);
+#print Dumper(\%host_order);
+
+die("you have a file called $MULTICONFIG_DIR!") if (-f $MULTICONFIG_DIR);
+if (!-d $MULTICONFIG_DIR) {
+    system($MKDIR,'-p',$MULTICONFIG_DIR);
+}
+die("you have a file called $MULTICONFIG_LOGDIR!") if (-f $MULTICONFIG_LOGDIR);
+if (!-d $MULTICONFIG_LOGDIR) {
+    system($MKDIR,'-p',$MULTICONFIG_LOGDIR);
+}
+
+foreach my $host (keys %host_configs) {
+
+    my $this_template = '';
+    my $this_runfile = $DEFAULT_RUNFILE;
+    $this_runfile =~ s/rsnapshot.pid/rsnapshot-$host.pid/;
+
+    foreach my $line (split(/\n/,$template)) {
+	$line =~ s/$DEFAULT_RUNFILE/$this_runfile/;
+	$this_template .= $line . "\n";
+    }
+    my $this_backup = '';
+    foreach my $remote (keys %{$host_configs{$host}}) {
+	$this_backup .= 'backup' . "\t" . $remote . "\t" . $host_configs{$host}{$remote}{dest} . "\t" . $host_configs{$host}{$remote}{opts} . "\n";
+    }
+    
+    open(CONFIG_FILE,'>' . "$MULTICONFIG_DIR/$host.conf");
+    print CONFIG_FILE $this_template;
+    print CONFIG_FILE $this_backup;
+    close CONFIG_FILE;
+}
+
+if ($do_crontab) {
+    my $crontab = '';
+    my $minute = $START_HOUR * 60 + $START_MINUTE;
+    
+    $crontab .= makeCrontabLine($minute,$KILLALL_COMMAND,"$MULTICONFIG_LOGDIR/rsnapshot-parallel");
+    $minute++;
+
+    foreach my $host (sort { $host_order{$a} <=> $host_order{$b} } (keys %host_configs)) {
+	$minute += $JOB_INTERVAL;
+	$crontab .= makeCrontabLine($minute,makeRsnapshotCommand($host),"$MULTICONFIG_LOGDIR/rsnapshot-$host");
+    }
+    
+    open(CRONFILE, '>' . $CRON_FILE);
+    print CRONFILE $crontab;
+    close CRONFILE;
+}
+
+if ($do_bomb) {
+    foreach my $host (sort { $host_order{$a} <=> $host_order{$b} } (keys %host_configs)) {
+        $command = "$NICE_COMMAND " . makeRsnapshotCommand($host) . " >> $MULTICONFIG_LOGDIR/rsnapshot-$host 2>&1 &";
+	for ( scalar fork ) {
+	    die "Couldn't fork: $!\n" if not defined;
+	    if ( my $kid = $_ ) {
+		# waitpid $kid, 0;
+		# could do some kind of status thing here
+	    }
+	    else {
+		exec $command;
+	    }
+	}
+    }
+}
+    
+sub makeRsnapshotCommand {
+    my $host = shift;
+    my $rsnapshot_command = $RSNAPSHOT_COMMAND;
+    $rsnapshot_command =~ s/HOST/$host/g;
+    return $rsnapshot_command;
+}
+
+sub makeCrontabLine {
+    my ($min,$command,$logfile) = @_;
+    my ($hour,$minute) = minToHM($min);
+    return "$minute $hour * * * root $command >> $logfile 2>&1\n";
+}
+
+sub minToHM {
+    use integer;
+    my $min = shift;
+    my $hour = $min / 60;
+    my $minute = $min % 60;
+    return ($hour,$minute);
+}
