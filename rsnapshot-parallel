@@ -12,7 +12,7 @@ my $MULTICONFIG_LOGDIR = '/var/log/rsnapshot-parallel';
 my $CRON_FILE = '/etc/cron.d/rsnapshot';
 my $START_HOUR = 00;
 my $START_MINUTE = 44;
-my $JOB_INTERVAL = 15; #minutes, no fancy date math is handled - be careful
+my $JOB_INTERVAL = 10; #minutes, no fancy date math is handled - be careful
 my $NICE = 10;
 my $IONICE = 7;
 my $BARRIER = '### BACKUP POINTS / SCRIPTS ###';  #below this in the config file are hosts
@@ -105,8 +105,8 @@ if ($do_crontab) {
     $minute++;
 
     foreach my $host (sort { $host_order{$a} <=> $host_order{$b} } (keys %host_configs)) {
-	$minute += $JOB_INTERVAL;
 	$crontab .= makeCrontabLine($minute,makeRsnapshotCommand($host),"$MULTICONFIG_LOGDIR/rsnapshot-$host");
+	$minute += $JOB_INTERVAL;
     }
     
     open(CRONFILE, '>' . $CRON_FILE);
